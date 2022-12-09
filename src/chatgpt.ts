@@ -11,15 +11,19 @@ export class ChatGPTBot {
   chatGPTPools: Array<ChatGPTAPI> | [] = [];
   cache = new Cache("cache.json");
   botName: string = "";
+  // 是否在处理中
+  processing: Map<string, boolean> = new Map<string, boolean>();
+
   setBotName(botName: string) {
     this.botName = botName;
   }
+
   async getSessionToken(email: string, password: string): Promise<string> {
     if (this.cache.get(email)) {
       return this.cache.get(email);
     }
     const cmd = `poetry run python3 src/generate_session.py ${email} ${password}`;
-    const { stdout, stderr, exitCode } = await execa(`sh`, ["-c", cmd]);
+    const {stdout, stderr, exitCode} = await execa(`sh`, ["-c", cmd]);
     if (exitCode !== 0) {
       console.error(stderr);
       return "";
@@ -32,38 +36,40 @@ export class ChatGPTBot {
     }
     return "";
   }
+
   async startGPTBot() {
     const chatGPTPools = (
-      await Promise.all(
-        config.chatGPTAccountPool.map(
-          async (account: {
-            email?: string;
-            password?: string;
-            session_token?: string;
-          }): Promise<string> => {
-            if (account.session_token) {
-              return account.session_token;
-            } else if (account.email && account.password) {
-              return await this.getSessionToken(
-                account.email,
-                account.password
-              );
-            } else {
-              return "";
-            }
-          }
+        await Promise.all(
+            config.chatGPTAccountPool.map(
+                async (account: {
+                  email?: string;
+                  password?: string;
+                  session_token?: string;
+                }): Promise<string> => {
+                  if (account.session_token) {
+                    return account.session_token;
+                  } else if (account.email && account.password) {
+                    return await this.getSessionToken(
+                        account.email,
+                        account.password
+                    );
+                  } else {
+                    return "";
+                  }
+                }
+            )
         )
-      )
     )
-      .filter((token: string) => token !== "")
-      .map((token: string) => {
-        return new ChatGPTAPI({
-          sessionToken: token,
+        .filter((token: string) => token !== "")
+        .map((token: string) => {
+          return new ChatGPTAPI({
+            sessionToken: token,
+          });
         });
-      });
     console.log(`Chatgpt pool size: ${chatGPTPools.length}`);
     this.chatGPTPools = chatGPTPools;
   }
+
   get chatgpt(): ChatGPTAPI {
     if (this.chatGPTPools.length === 0) {
       throw new Error("No chatgpt session token");
@@ -73,10 +79,12 @@ export class ChatGPTBot {
     const index = Math.floor(Math.random() * this.chatGPTPools.length);
     return this.chatGPTPools[index];
   }
+
   resetConversation(talkerId: string): void {
     const chatgpt = this.chatgpt;
     this.conversations.set(talkerId, chatgpt.getConversation());
   }
+
   getConversation(talkerId: string): ChatGPTConversation {
     const chatgpt = this.chatgpt;
     if (this.conversations.get(talkerId) !== undefined) {
@@ -86,8 +94,11 @@ export class ChatGPTBot {
     this.conversations.set(talkerId, conversation);
     return conversation;
   }
+
   // TODO: Add reset conversation id and ping pong
-  async command(): Promise<void> {}
+  async command(): Promise<void> {
+  }
+
   // remove more times conversation and mention
   cleanMessage(text: string): string {
     let realText = text;
@@ -98,6 +109,7 @@ export class ChatGPTBot {
     // remove more text via - - - - - - - - - - - - - - -
     return realText;
   }
+
   async getGPTMessage(text: string, talkerId: string): Promise<string> {
     const conversation = this.getConversation(talkerId);
     try {
@@ -108,13 +120,13 @@ export class ChatGPTBot {
       return String(e);
     }
   }
+
   // The message is segmented according to its size
   async trySay(
-    talker: RoomInterface | ContactInterface,
-    mesasge: string
+      talker: RoomInterface | ContactInterface,
+      message: string
   ): Promise<void> {
     const messages: Array<string> = [];
-    let message = mesasge;
     while (message.length > 300) {
       messages.push(message.slice(0, 300));
       message = message.slice(300);
@@ -124,34 +136,44 @@ export class ChatGPTBot {
       await talker.say(msg);
     }
   }
+
   async onMessage(message: Message) {
     const talker = message.talker();
     if (talker.self() || message.type() > 10) {
       return;
     }
-    const text = message.text();
-    const room = message.room();
-    if (!room) {
-      console.log(`🎯 Hit GPT Enabled User: ${talker.name()}`);
-      const response = await this.getGPTMessage(text, talker.id);
-      await this.trySay(talker, response);
-      return;
+    if (this.processing.get(talker.id)) {
+      return await this.trySay(talker, "正在努力解答中，请稍后");
     }
-    let realText = this.cleanMessage(text);
-    // The bot should reply mention message
-    if (!realText.includes(`@${this.botName}`)) {
-      return;
+    this.processing.set(talker.id, true);
+    try {
+      const text = message.text();
+      const room = message.room();
+      if (!room) {
+        console.log(`🎯 Hit GPT Enabled User: ${talker.name()}`);
+        const response = await this.getGPTMessage(text, talker.id);
+        return await this.trySay(talker, response);
+      }
+      let realText = this.cleanMessage(text);
+      // The bot should reply mention message
+      if (!realText.includes(`@${this.botName}`)) {
+        return;
+      }
+      realText = text.replace(`@${this.botName}`, "");
+      const topic = await room.topic();
+      console.debug(
+          `receive message: ${realText} from ${talker.name()} in ${topic}, room: ${
+              room.id
+          }`
+      );
+      console.log(`Hit GPT Enabled Group: ${topic} in room: ${room.id}`);
+      const response = await this.getGPTMessage(realText, talker.id);
+      const result = `${realText}\n ------\n ${response}`;
+      await this.trySay(room, result);
+    } catch (e) {
+      console.log(e)
+    } finally {
+      this.processing.set(talker.id, false);
     }
-    realText = text.replace(`@${this.botName}`, "");
-    const topic = await room.topic();
-    console.debug(
-      `receive message: ${realText} from ${talker.name()} in ${topic}, room: ${
-        room.id
-      }`
-    );
-    console.log(`Hit GPT Enabled Group: ${topic} in room: ${room.id}`);
-    const response = await this.getGPTMessage(realText, talker.id);
-    const result = `${realText}\n ------\n ${response}`;
-    await this.trySay(room, result);
   }
 }
